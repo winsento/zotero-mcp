@@ -14,6 +14,7 @@ import json
 import re
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from fastmcp import Context, FastMCP
 
@@ -28,9 +29,74 @@ from zotero_mcp.client import (
     get_zotero_client,
     set_active_library,
 )
+import httpx
 import requests
 
 from zotero_mcp.utils import format_creators, clean_html
+
+
+def _file_url_to_local_path(file_url: str) -> Path | None:
+    try:
+        parsed = urlparse(file_url)
+    except Exception:
+        return None
+    if parsed.scheme != "file":
+        return None
+    path = unquote(parsed.path or "")
+    # Windows file URLs may be "/C:/..." - strip the leading slash.
+    if re.match(r"^/[A-Za-z]:/", path):
+        path = path[1:]
+    if not path:
+        return None
+    return Path(path)
+
+
+def _dump_attachment_via_local_redirect(zot, attachment_key: str, dest: Path) -> bool:
+    """Fetch attachment bytes by resolving the local API redirect to a file:// path."""
+    from pyzotero._utils import build_url
+
+    file_url = build_url(
+        zot.endpoint,
+        f"/{zot.library_type}/{zot.library_id}/items/{attachment_key}/file",
+    )
+
+    # Do NOT follow redirects here; Zotero local API returns 302 to file://...
+    resp = httpx.Client(headers=zot.default_headers(), follow_redirects=False).get(
+        file_url,
+    )
+    if resp.status_code == 200 and resp.content:
+        dest.write_bytes(resp.content)
+        return True
+
+    location = resp.headers.get("Location") or resp.headers.get("location")
+    if not location:
+        return False
+    local_path = _file_url_to_local_path(location)
+    if not local_path:
+        return False
+    dest.write_bytes(local_path.read_bytes())
+    return True
+
+
+def dump_attachment_to_file(zot, attachment_key: str, dest: Path, *, ctx: Context) -> None:
+    """
+    Dump an attachment to disk.
+
+    Local Zotero API may redirect `/file` to a `file://...` URL. httpx won't follow
+    scheme-changing redirects, so we resolve it ourselves when needed.
+    """
+    try:
+        zot.dump(attachment_key, filename=dest.name, path=str(dest.parent))
+        return
+    except Exception as dump_error:
+        if "unsupported protocol 'file://'" not in str(dump_error):
+            raise
+
+    ctx.info("Attachment download hit file:// redirect; resolving via local file path")
+    ok = _dump_attachment_via_local_redirect(zot, attachment_key, dest)
+    if not ok:
+        raise RuntimeError("Failed to resolve file:// redirect for attachment download")
+
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP):
@@ -423,12 +489,12 @@ def get_item_fulltext(
             import os
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                file_path = os.path.join(tmpdir, attachment.filename or f"{attachment.key}.pdf")
-                zot.dump(attachment.key, filename=os.path.basename(file_path), path=tmpdir)
+                file_path = Path(tmpdir) / (attachment.filename or f"{attachment.key}.pdf")
+                dump_attachment_to_file(zot, attachment.key, file_path, ctx=ctx)
 
-                if os.path.exists(file_path):
+                if file_path.exists():
                     ctx.info(f"Downloaded file to {file_path}, converting to markdown")
-                    converted_text = convert_to_markdown(file_path)
+                    converted_text = convert_to_markdown(str(file_path))
                     return f"{metadata}\n\n---\n\n## Full Text\n\n{converted_text}"
                 else:
                     return f"{metadata}\n\n---\n\nFile download failed."
@@ -1805,15 +1871,11 @@ def _get_annotations(
                         for attachment in pdf_attachments:
                             with tempfile.TemporaryDirectory() as tmpdir:
                                 att_key = attachment.get("key", "")
-                                file_path = os.path.join(tmpdir, f"{att_key}.pdf")
-                                zot.dump(
-                                    att_key,
-                                    filename=os.path.basename(file_path),
-                                    path=tmpdir,
-                                )
+                                file_path = Path(tmpdir) / f"{att_key}.pdf"
+                                dump_attachment_to_file(zot, att_key, file_path, ctx=ctx)
 
-                                if os.path.exists(file_path):
-                                    extracted = extract_annotations_from_pdf(file_path, tmpdir)
+                                if file_path.exists():
+                                    extracted = extract_annotations_from_pdf(str(file_path), tmpdir)
 
                                     for ext in extracted:
                                         # Skip empty annotations
