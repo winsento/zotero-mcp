@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
-from markitdown import MarkItDown
 from pyzotero import zotero
 
 from zotero_mcp.utils import format_creators
@@ -493,7 +492,13 @@ def get_attachment_details(
 
 def convert_to_markdown(file_path: str | Path) -> str:
     """
-    Convert a file to markdown using markitdown library.
+    Convert a file to markdown.
+
+    Best-effort behavior:
+    - Prefer `markitdown` when available (supports multiple formats).
+    - Fall back to a lightweight PDF text extractor when markitdown fails to import
+      (some environments have issues importing `onnxruntime` through markitdown's
+      optional dependency chain).
 
     Args:
         file_path: Path to the file to convert.
@@ -501,9 +506,36 @@ def convert_to_markdown(file_path: str | Path) -> str:
     Returns:
         Markdown text.
     """
-    try:
+    path = Path(file_path)
+
+    def _convert_with_markitdown() -> str:
+        from markitdown import MarkItDown  # type: ignore[import-not-found]
+
         md = MarkItDown()
-        result = md.convert(str(file_path))
+        result = md.convert(str(path))
         return result.text_content
-    except Exception as e:
-        return f"Error converting file to markdown: {str(e)}"
+
+    def _convert_pdf_with_pymupdf() -> str:
+        import fitz  # PyMuPDF
+
+        doc = fitz.open(str(path))
+        try:
+            parts: list[str] = []
+            for page in doc:
+                parts.append(page.get_text("text"))
+            return "\n".join(parts).strip()
+        finally:
+            doc.close()
+
+    try:
+        return _convert_with_markitdown()
+    except Exception as markitdown_error:
+        if path.suffix.lower() == ".pdf":
+            try:
+                return _convert_pdf_with_pymupdf()
+            except Exception as pdf_error:
+                return (
+                    "Error converting file to markdown: "
+                    f"{markitdown_error} (PDF fallback failed: {pdf_error})"
+                )
+        return f"Error converting file to markdown: {markitdown_error}"
