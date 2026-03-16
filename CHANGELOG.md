@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-03-16
+
 ### Fixed
 - Handle local Zotero API `/file` redirects to `file://...` when downloading attachments (fulltext and PDF-extraction annotations).
+- Avoid crashing on import in some environments by lazily importing `markitdown`; add a lightweight PDF fallback conversion path.
+- Make `import zotero_mcp` lightweight by lazily importing the server (`mcp`) only when requested.
 
 ## [0.1.3] - 2026-02-20
 
