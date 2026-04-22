@@ -1104,7 +1104,7 @@ def _probe_identifier_from_direct_pdf_url(
                             web_zot.delete_item(web_payload)
 
     try:
-        pdf_bytes, _ = _download_pdf_bytes(pdf_url, ctx=ctx)
+        pdf_bytes, _, pdf_headers = _download_pdf_bytes(pdf_url, ctx=ctx)
     except Exception as exc:
         _ctx_warning(ctx, f"Direct PDF probe download failed for {pdf_url}: {exc}")
         connector_signals = _probe_via_local_connector()
@@ -1117,6 +1117,9 @@ def _probe_identifier_from_direct_pdf_url(
         return None
 
     signals = _extract_pdf_probe_signals(pdf_bytes, pdf_url=pdf_url, ctx=ctx)
+    # Pass response headers through so the direct-PDF fallback title cascade can
+    # parse Content-Disposition (see _build_direct_pdf_fallback_title).
+    signals["response_headers"] = pdf_headers
     if signals.get("doi") or signals.get("arxiv_id") or signals.get("title"):
         return signals
     connector_signals = _probe_via_local_connector()
@@ -4590,7 +4593,7 @@ def _download_pdf_bytes_via_playwright(
     pdf_url: str,
     *,
     ctx: Context | None = None,
-) -> tuple[bytes, str] | None:
+) -> tuple[bytes, str, dict[str, str]] | None:
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
     except Exception:
@@ -4667,7 +4670,7 @@ def _download_pdf_bytes_via_playwright(
                         if body and (
                             "application/pdf" in content_type.lower() or body.startswith(b"%PDF")
                         ):
-                            return body, content_type or "application/pdf"
+                            return body, content_type or "application/pdf", dict(headers)
 
                 candidate_urls: list[str] = []
                 for candidate in [str(page.url or ""), pdf_url, *response_urls]:
@@ -4702,7 +4705,7 @@ def _download_pdf_bytes_via_playwright(
                         if body and (
                             "application/pdf" in content_type.lower() or body.startswith(b"%PDF")
                         ):
-                            return body, content_type or "application/pdf"
+                            return body, content_type or "application/pdf", dict(headers)
             finally:
                 context.close()
                 if browser is not None:
@@ -4715,7 +4718,9 @@ def _download_pdf_bytes_via_playwright(
     return None
 
 
-def _download_pdf_bytes(pdf_url: str, *, ctx: Context | None = None) -> tuple[bytes, str]:
+def _download_pdf_bytes(
+    pdf_url: str, *, ctx: Context | None = None
+) -> tuple[bytes, str, dict[str, str]]:
     headers = {"User-Agent": "Mozilla/5.0 zotero-mcp/1.0"}
     errors: list[str] = []
     request_plans = [
@@ -4749,7 +4754,7 @@ def _download_pdf_bytes(pdf_url: str, *, ctx: Context | None = None) -> tuple[by
 
             if "application/pdf" not in content_type.lower() and not first_chunk.startswith(b"%PDF"):
                 raise ValueError("response is not a PDF")
-            return pdf_bytes, content_type
+            return pdf_bytes, content_type, dict(response.headers)
         except Exception as exc:
             errors.append(f"{plan['label']} attempt {index}: {exc}")
             if index < len(request_plans):
@@ -4823,7 +4828,7 @@ def _attach_pdf_from_url(
                 )
 
         ctx.info(f"Downloading PDF from {pdf_url}")
-        pdf_bytes, _ = _download_pdf_bytes(pdf_url, ctx=ctx)
+        pdf_bytes, _, _ = _download_pdf_bytes(pdf_url, ctx=ctx)
         with tempfile.TemporaryDirectory(prefix="zotero-mcp-") as tmpdir:
             tmp_path = Path(tmpdir) / filename
             tmp_path.write_bytes(pdf_bytes)

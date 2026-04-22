@@ -1526,7 +1526,7 @@ def test_identifier_direct_pdf_probe_prefers_paper_import_over_webpage(
     monkeypatch.setattr(
         server,
         "_download_pdf_bytes",
-        lambda pdf_url, *, ctx=None: (PDF_BYTES, "application/pdf"),
+        lambda pdf_url, *, ctx=None: (PDF_BYTES, "application/pdf", {}),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -1581,7 +1581,7 @@ def test_identifier_direct_pdf_probe_can_use_playwright_download_fallback(
     monkeypatch.setattr(
         server,
         "_download_pdf_bytes_via_playwright",
-        lambda pdf_url, *, ctx=None: (PDF_BYTES, "application/pdf"),
+        lambda pdf_url, *, ctx=None: (PDF_BYTES, "application/pdf", {}),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -1630,7 +1630,7 @@ def test_identifier_direct_pdf_probe_can_rescue_doi_via_crossref_title_match(
     monkeypatch.setattr(
         server,
         "_download_pdf_bytes",
-        lambda pdf_url, *, ctx=None: (PDF_BYTES, "application/pdf"),
+        lambda pdf_url, *, ctx=None: (PDF_BYTES, "application/pdf", {}),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -2003,7 +2003,7 @@ def test_download_pdf_bytes_retries_after_timeout(monkeypatch):
 
     monkeypatch.setattr(server.requests, "get", fake_get)
     monkeypatch.setattr(server.time, "sleep", lambda *_: None)
-    pdf_bytes, content_type = server._download_pdf_bytes("https://example.com/paper.pdf")
+    pdf_bytes, content_type, _ = server._download_pdf_bytes("https://example.com/paper.pdf")
     assert pdf_bytes == PDF_BYTES
     assert content_type == "application/pdf"
     assert calls["n"] == 2
@@ -2021,10 +2021,10 @@ def test_download_pdf_bytes_falls_back_to_playwright_after_request_failures(monk
     monkeypatch.setattr(
         server,
         "_download_pdf_bytes_via_playwright",
-        lambda pdf_url, *, ctx=None: (PDF_BYTES, "application/pdf"),
+        lambda pdf_url, *, ctx=None: (PDF_BYTES, "application/pdf", {}),
     )
 
-    pdf_bytes, content_type = server._download_pdf_bytes(
+    pdf_bytes, content_type, _ = server._download_pdf_bytes(
         "https://example.com/protected.pdf",
         ctx=ctx,
     )
@@ -2189,7 +2189,7 @@ def test_attach_pdf_from_url_skips_slow_connector_url_host_after_timeout(
 
     def fake_download(url, *, ctx=None):
         calls["download"] += 1
-        return PDF_BYTES, "application/pdf"
+        return PDF_BYTES, "application/pdf", {}
 
     def fake_copy(*args, **kwargs):
         calls["copy"] += 1
@@ -3440,7 +3440,7 @@ def test_attach_pdf_from_url_recovers_materialized_local_copy_with_repair_proven
         lambda: {"current_collection_id": "COLSEL", "current_name": "Selected"},
     )
     monkeypatch.setattr(server, "_save_pdf_via_local_connector_url", lambda *a, **k: {"success": False, "message": "url attach timed out"})
-    monkeypatch.setattr(server, "_download_pdf_bytes", lambda url, *, ctx=None: (PDF_BYTES, "application/pdf"))
+    monkeypatch.setattr(server, "_download_pdf_bytes", lambda url, *, ctx=None: (PDF_BYTES, "application/pdf", {}))
     monkeypatch.setattr(server, "_save_pdf_via_local_connector_copy", lambda *a, **k: {"success": False, "message": "copy path failed"})
     monkeypatch.setattr(server, "_attach_pdf_via_local_zotero", lambda *a, **k: {"success": False, "message": "local attach pending"})
 
@@ -3502,7 +3502,7 @@ def test_attach_pdf_from_url_uses_context_warning_api_when_warn_is_missing(
     monkeypatch.setattr(server, "_get_item_payload", lambda *a, **k: None)
     monkeypatch.setattr(server, "_pdf_filename_for_item", lambda *a, **k: "Recovered Paper.pdf")
     monkeypatch.setattr(server, "_should_prefer_local_pdf_after_download", lambda *a, **k: False)
-    monkeypatch.setattr(server, "_download_pdf_bytes", lambda url, *, ctx=None: (PDF_BYTES, "application/pdf"))
+    monkeypatch.setattr(server, "_download_pdf_bytes", lambda url, *, ctx=None: (PDF_BYTES, "application/pdf", {}))
 
     result = server._attach_pdf_from_url(
         patch_web_client,
