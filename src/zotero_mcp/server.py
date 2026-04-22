@@ -8982,6 +8982,135 @@ def add_linked_url_attachment(
 
 
 @mcp.tool(
+    name="zotero_attach_file_to_item",
+    description=(
+        "Upload a local file (PDF, DOCX, EPUB, etc.) from disk to Zotero as an "
+        "imported_file attachment to an existing item. For PDFs, uses the full "
+        "attach cascade with Zotero local connector fallback; for other types, "
+        "uses pyzotero's attachment_simple / attachment_both directly. Requires "
+        "ZOTERO_API_KEY + ZOTERO_LIBRARY_ID for Web API uploads."
+    ),
+)
+def attach_file_to_item(
+    item_key: str,
+    file_path: str,
+    title: str | None = None,
+    *,
+    ctx: Context,
+) -> str:
+    """Attach a local file from disk to an existing Zotero item as imported_file.
+
+    Args:
+        item_key: Key of the parent Zotero item.
+        file_path: Absolute or ~-relative path to the local file.
+        title: Optional display title for the attachment (defaults to filename).
+        ctx: MCP context.
+
+    Returns:
+        Confirmation string with the new attachment key on success, or error.
+    """
+    try:
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file():
+            return f"Error: file not found at {path}"
+        zot = get_web_zotero_client()
+        if zot is None:
+            return (
+                "Error: Web API credentials not configured. "
+                "Set ZOTERO_API_KEY and ZOTERO_LIBRARY_ID."
+            )
+
+        if path.suffix.lower() == ".pdf":
+            pdf_bytes = path.read_bytes()
+            result = _attach_pdf_bytes(
+                zot,
+                item_key,
+                pdf_bytes,
+                filename=title or path.name,
+                ctx=ctx,
+                source=f"user_local_file:{path.name}",
+            )
+            if result.get("success"):
+                src = result.get("pdf_source", "local_file")
+                msg = result.get("message", "")
+                return f"✓ File attached to {item_key} ({src}): {msg}"
+            return f"✗ Attach failed: {result.get('message', 'unknown error')}"
+
+        # Non-PDF: use pyzotero directly.
+        if title:
+            resp = zot.attachment_both([(title, str(path))], item_key)
+        else:
+            resp = zot.attachment_simple([str(path)], item_key)
+        successful = resp.get("successful") or resp.get("success") or {}
+        if successful:
+            first = (
+                next(iter(successful.values()))
+                if isinstance(successful, dict)
+                else successful[0]
+            )
+            if isinstance(first, dict):
+                key = (first.get("data") or first).get("key", "?")
+            else:
+                key = "?"
+            return f"✓ File attached to {item_key} → attachment key `{key}`"
+        failed = resp.get("failed") or resp.get("failure") or {}
+        return f"✗ Failed: {failed}"
+    except Exception as exc:
+        ctx.error(f"Error in attach_file_to_item: {exc}")
+        return f"Error: {exc}"
+
+
+@mcp.tool(
+    name="zotero_attach_pdf_from_url",
+    description=(
+        "Download a PDF from a URL and attach it to an existing Zotero item "
+        "as an imported_file attachment. Reuses the identifier-import download "
+        "cascade: direct HTTP, Playwright fallback for protected hosts, Zotero "
+        "local connector fast-path for bulk uploads. Requires ZOTERO_API_KEY + "
+        "ZOTERO_LIBRARY_ID."
+    ),
+)
+def attach_pdf_from_url(
+    item_key: str,
+    url: str,
+    *,
+    ctx: Context,
+) -> str:
+    """Download a PDF by URL and attach to an existing item as imported_file.
+
+    Args:
+        item_key: Key of the parent Zotero item.
+        url: URL of the PDF to download and attach.
+        ctx: MCP context.
+
+    Returns:
+        Confirmation string with the outcome, or error message.
+    """
+    try:
+        zot = get_web_zotero_client()
+        if zot is None:
+            return (
+                "Error: Web API credentials not configured. "
+                "Set ZOTERO_API_KEY and ZOTERO_LIBRARY_ID."
+            )
+        result = _attach_pdf_from_url(
+            zot,
+            item_key,
+            url,
+            ctx=ctx,
+            source=f"user_url:{url}",
+        )
+        if result.get("success"):
+            src = result.get("pdf_source", "url")
+            msg = result.get("message", "")
+            return f"✓ PDF attached to {item_key} ({src}): {msg}"
+        return f"✗ Attach failed: {result.get('message', 'unknown error')}"
+    except Exception as exc:
+        ctx.error(f"Error in attach_pdf_from_url: {exc}")
+        return f"Error: {exc}"
+
+
+@mcp.tool(
     name="zotero_add_items_by_arxiv",
     description=(
         "Add one or more preprints to Zotero by arXiv ID. Uses arXiv metadata "
