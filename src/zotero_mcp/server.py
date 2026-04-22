@@ -9347,11 +9347,19 @@ def add_items_by_identifier(
                             ctx=ctx,
                         )
                         continue
+                    _pdf_headers = (
+                        pdf_signals.get("response_headers") if pdf_signals else None
+                    )
                     created = _create_webpage_item(
                         zot,
                         raw_identifier,
                         collection_key=collection_key,
-                        title=Path(urlparse(raw_identifier).path).name or raw_identifier,
+                        title=_build_direct_pdf_fallback_title(
+                            raw_identifier,
+                            pdf_signals,
+                            _pdf_headers,
+                            ctx=ctx,
+                        ),
                         description="Imported from direct PDF URL; bibliographic metadata still needs review.",
                         abstract_note="Imported from direct PDF URL; bibliographic metadata still needs review.",
                         creators=[],
