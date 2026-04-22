@@ -117,3 +117,61 @@ class TestAttachFileToItem:
             ctx=ctx,
         )
         assert "Web API credentials" in result
+
+
+class TestAttachPdfFromUrl:
+    def test_delegates_to_private_helper(self, monkeypatch, ctx):
+        captured = {}
+
+        def fake_attach(zot, item_key, url, *, ctx, source):
+            captured["item_key"] = item_key
+            captured["url"] = url
+            captured["source"] = source
+            return {
+                "success": True,
+                "pdf_source": f"user_url:{url}",
+                "message": f"PDF attached from user_url:{url}",
+            }
+
+        monkeypatch.setattr(server, "get_web_zotero_client", lambda: object())
+        monkeypatch.setattr(server, "_attach_pdf_from_url", fake_attach)
+
+        result = server.attach_pdf_from_url(
+            item_key="ABC123",
+            url="http://example.org/paper.pdf",
+            ctx=ctx,
+        )
+
+        assert captured["item_key"] == "ABC123"
+        assert captured["url"] == "http://example.org/paper.pdf"
+        assert captured["source"] == "user_url:http://example.org/paper.pdf"
+        assert "✓" in result and "ABC123" in result
+
+    def test_propagates_failure_message(self, monkeypatch, ctx):
+        def fake_attach(zot, item_key, url, *, ctx, source):
+            return {
+                "success": False,
+                "pdf_source": f"user_url:{url}",
+                "message": "download failed: 403 Forbidden",
+            }
+
+        monkeypatch.setattr(server, "get_web_zotero_client", lambda: object())
+        monkeypatch.setattr(server, "_attach_pdf_from_url", fake_attach)
+
+        result = server.attach_pdf_from_url(
+            item_key="ABC123",
+            url="http://protected.example/paper.pdf",
+            ctx=ctx,
+        )
+
+        assert "✗" in result
+        assert "403" in result
+
+    def test_no_web_client_returns_error(self, monkeypatch, ctx):
+        monkeypatch.setattr(server, "get_web_zotero_client", lambda: None)
+        result = server.attach_pdf_from_url(
+            item_key="ABC123",
+            url="http://example.com/x.pdf",
+            ctx=ctx,
+        )
+        assert "Web API credentials" in result
