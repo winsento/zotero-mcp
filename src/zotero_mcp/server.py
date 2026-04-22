@@ -22,7 +22,7 @@ import tempfile
 import textwrap
 import time
 from typing import Any, Literal
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -1898,6 +1898,30 @@ def _fallback_signals_from_known_landing_page(url: str) -> dict[str, Any] | None
         "pdf_candidates": [{"source": "url_pattern:cvf_pdf", "url": inferred_pdf_url}],
         "content_type": "",
     }
+
+
+def _guess_landing_page_url(pdf_url: str) -> str | None:
+    """Heuristic: for URLs like https://host/path/doc.pdf, return
+    https://host/path/ as a potential HTML landing page. Returns None if the
+    input is not a .pdf URL or if the .pdf lives directly at the host root.
+
+    Used by the direct-PDF fallback title cascade as a second-tier title
+    source when PDF XMP metadata doesn't provide a good title.
+    """
+    parsed = urlparse(pdf_url)
+    if not parsed.path.lower().endswith(".pdf"):
+        return None
+    parent = str(Path(parsed.path).parent)
+    if parent in ("/", "", "."):
+        return None
+    return urlunparse(
+        parsed._replace(
+            path=parent.rstrip("/") + "/",
+            params="",
+            query="",
+            fragment="",
+        )
+    )
 
 
 def _fetch_page_signals(url: str, *, ctx: Context) -> dict[str, Any]:
