@@ -60,3 +60,63 @@ class TestHTMLCharsetDetection:
         # with errors="replace", the result must be a non-empty string.
         assert isinstance(result, str)
         assert len(result) > 0
+
+    # ----- integration: _fetch_page_signals uses cascade + html.unescape -----
+
+    def _mock_urlopen(self, monkeypatch, *, headers, body, final_url):
+        """Helper that replaces urllib.request.urlopen with a fake response."""
+        import urllib.request
+
+        class _FakeResponse:
+            def __init__(self_inner):
+                self_inner.headers = headers
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                return False
+
+            def geturl(self_inner):
+                return final_url
+
+            def read(self_inner, *_args, **_kwargs):
+                return body
+
+        monkeypatch.setattr(
+            urllib.request,
+            "urlopen",
+            lambda req, timeout=None: _FakeResponse(),
+        )
+
+    def test_fetch_page_signals_unescapes_html_entities_in_title(
+        self, monkeypatch, ctx
+    ):
+        # Numeric HTML entities for arbitrary non-ASCII characters ("АБВГ"
+        # — Cyrillic hex used purely to verify html.unescape runs).
+        body = b"<html><head><title>&#x0410;&#x0411;&#x0412;&#x0413;</title></head></html>"
+        self._mock_urlopen(
+            monkeypatch,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            body=body,
+            final_url="https://example.org",
+        )
+        signals = server._fetch_page_signals("https://example.org", ctx=ctx)
+        assert signals["title"] == "АБВГ"
+
+    def test_fetch_page_signals_decodes_cp1251_title(self, monkeypatch, ctx):
+        body = (
+            b"<html><head>"
+            + "<title>Пример документа</title>".encode("cp1251")
+            + b"</head></html>"
+        )
+        self._mock_urlopen(
+            monkeypatch,
+            headers={"Content-Type": "text/html; charset=windows-1251"},
+            body=body,
+            final_url="https://legacy-cms.example.com/doc/12345/",
+        )
+        signals = server._fetch_page_signals(
+            "https://legacy-cms.example.com/doc/12345/", ctx=ctx
+        )
+        assert signals["title"] == "Пример документа"

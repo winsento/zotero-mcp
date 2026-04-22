@@ -1985,7 +1985,7 @@ def _fetch_page_signals(url: str, *, ctx: Context) -> dict[str, Any]:
         signals["pdf_candidates"].append({"source": "direct_pdf", "url": signals["final_url"]})
         return signals
 
-    html = body.decode("utf-8", errors="replace")
+    html = _decode_html_body(body, content_type)
     jsonld_blocks = _extract_jsonld_blocks(html)
 
     signals["title"] = (
@@ -2052,6 +2052,15 @@ def _fetch_page_signals(url: str, *, ctx: Context) -> dict[str, Any]:
     signals["pdf_candidates"].extend(_infer_pdf_candidates_from_url(signals["final_url"]))
     signals["pdf_candidates"].extend(_infer_pdf_candidates_from_url(url))
     signals["pdf_candidates"] = _dedupe_pdf_candidates(signals["pdf_candidates"])
+
+    # Resolve HTML entities (e.g., &#xNNNN;) in extracted text fields so that
+    # UTF-8 pages encoding non-ASCII characters as numeric entities surface as
+    # readable strings instead of escape sequences.
+    for _field in ("title", "description", "abstract_note", "venue"):
+        value = signals.get(_field)
+        if value and isinstance(value, str):
+            signals[_field] = unescape(value)
+
     return signals
 
 
