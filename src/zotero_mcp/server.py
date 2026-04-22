@@ -1117,16 +1117,15 @@ def _probe_identifier_from_direct_pdf_url(
         return None
 
     signals = _extract_pdf_probe_signals(pdf_bytes, pdf_url=pdf_url, ctx=ctx)
-    if signals.get("doi") or signals.get("arxiv_id") or signals.get("title"):
-        return signals
-    connector_signals = _probe_via_local_connector()
-    if connector_signals and (
-        connector_signals.get("doi")
-        or connector_signals.get("arxiv_id")
-        or connector_signals.get("title")
-    ):
-        return connector_signals
-    return None
+    # Always return the extracted signals (possibly empty). The caller uses
+    # signals.get("title") for the fallback title cascade. Calling the
+    # connector probe as a second-pass after a successful direct download is
+    # unnecessary — we already have the PDF bytes and PyMuPDF extracted what
+    # it could — and it leaks `zotero-mcp-pdf-probe-<uuid>` items into the
+    # collection when its cleanup silently fails due to local/web API sync
+    # delay. The connector remains a legitimate fallback in the except-branch
+    # above, where the direct download itself failed (auth cookies, CDN).
+    return signals
 
 
 def _venue_candidates_from_urlish(url: str | None) -> list[str]:
