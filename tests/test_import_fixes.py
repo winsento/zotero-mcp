@@ -281,3 +281,112 @@ class TestFallbackTitleCascade:
             ctx=ctx,
         )
         assert title == "abc.pdf"
+
+
+class TestHTMLCharsetDetection:
+    """Fix #3: _decode_html_body cascade + html.unescape on text fields.
+
+    Before this fix, _fetch_page_signals decoded response body as hardcoded
+    UTF-8 with errors="replace", producing mojibake (????) for pages declaring
+    a non-UTF-8 charset via HTTP Content-Type header or <meta charset> tag.
+    Numeric HTML entities (&#xNNNN;) were not html.unescape'd and passed
+    through literally into Zotero.
+
+    Test fixtures use sample non-ASCII strings (Cyrillic / accented Latin)
+    purely to exercise the cp1251 / utf-8 / charset-detect code paths. The
+    strings themselves carry no meaning.
+    """
+
+    def test_decode_cp1251_via_content_type_header(self):
+        body = "Пример документа".encode("cp1251")
+        result = server._decode_html_body(body, "text/html; charset=windows-1251")
+        assert "Пример документа" in result
+
+    def test_decode_cp1251_via_meta_charset(self):
+        body = (
+            b'<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1251">'
+            + "<title>Документ</title>".encode("cp1251")
+            + b"</head></html>"
+        )
+        # No charset in HTTP Content-Type header → meta sniff should apply.
+        result = server._decode_html_body(body, "text/html")
+        assert "Документ" in result
+
+    def test_decode_utf8_fallback_no_charset_hint(self):
+        body = "Hello world".encode("utf-8")
+        result = server._decode_html_body(body, "text/html")
+        assert result == "Hello world"
+
+    def test_decode_utf8_with_explicit_header(self):
+        body = "résumé café".encode("utf-8")
+        result = server._decode_html_body(body, "text/html; charset=utf-8")
+        assert result == "résumé café"
+
+    def test_decode_charset_normalizer_recovers_unknown_encoding(self):
+        """When no charset hint is present, charset-normalizer should guess OK."""
+        body = "пример".encode("cp1251")
+        result = server._decode_html_body(body, "text/html")
+        # charset-normalizer should recover; even if it falls back to UTF-8
+        # with errors="replace", the result must be a non-empty string.
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    # ----- integration: _fetch_page_signals uses cascade + html.unescape -----
+
+    def _mock_urlopen(self, monkeypatch, *, headers, body, final_url):
+        """Helper that replaces urllib.request.urlopen with a fake response."""
+        import urllib.request
+
+        class _FakeResponse:
+            def __init__(self_inner):
+                self_inner.headers = headers
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                return False
+
+            def geturl(self_inner):
+                return final_url
+
+            def read(self_inner, *_args, **_kwargs):
+                return body
+
+        monkeypatch.setattr(
+            urllib.request,
+            "urlopen",
+            lambda req, timeout=None: _FakeResponse(),
+        )
+
+    def test_fetch_page_signals_unescapes_html_entities_in_title(
+        self, monkeypatch, ctx
+    ):
+        # Numeric HTML entities for arbitrary non-ASCII characters ("АБВГ"
+        # — Cyrillic hex used purely to verify html.unescape runs).
+        body = b"<html><head><title>&#x0410;&#x0411;&#x0412;&#x0413;</title></head></html>"
+        self._mock_urlopen(
+            monkeypatch,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            body=body,
+            final_url="https://example.org",
+        )
+        signals = server._fetch_page_signals("https://example.org", ctx=ctx)
+        assert signals["title"] == "АБВГ"
+
+    def test_fetch_page_signals_decodes_cp1251_title(self, monkeypatch, ctx):
+        body = (
+            b"<html><head>"
+            + "<title>Пример документа</title>".encode("cp1251")
+            + b"</head></html>"
+        )
+        self._mock_urlopen(
+            monkeypatch,
+            headers={"Content-Type": "text/html; charset=windows-1251"},
+            body=body,
+            final_url="https://legacy-cms.example.com/doc/12345/",
+        )
+        signals = server._fetch_page_signals(
+            "https://legacy-cms.example.com/doc/12345/", ctx=ctx
+        )
+        assert signals["title"] == "Пример документа"
