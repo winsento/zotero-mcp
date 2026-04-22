@@ -77,3 +77,96 @@ class TestFallbackTitleCascade:
         assert server._parse_content_disposition_filename("") is None
         assert server._parse_content_disposition_filename("inline") is None
         assert server._parse_content_disposition_filename("attachment") is None
+
+    # ----- cascade: _build_direct_pdf_fallback_title -----
+
+    def test_cascade_xmp_title_wins(self, ctx):
+        signals = {"title": "Official XMP Title"}
+        title = server._build_direct_pdf_fallback_title(
+            "https://gov.example/files/abc.pdf",
+            signals,
+            None,
+            ctx=ctx,
+        )
+        assert title == "Official XMP Title"
+
+    def test_cascade_landing_page_fallback_when_xmp_empty(self, monkeypatch, ctx):
+        signals = {"title": None}
+        monkeypatch.setattr(
+            server,
+            "_fetch_page_signals",
+            lambda url, *, ctx: {"title": "From HTML Landing Page"},
+        )
+        title = server._build_direct_pdf_fallback_title(
+            "https://gov.example/docs/2018/doc.pdf",
+            signals,
+            None,
+            ctx=ctx,
+        )
+        assert title == "From HTML Landing Page"
+
+    def test_cascade_content_disposition_fallback(self, monkeypatch, ctx):
+        signals = {"title": None}
+        headers = {
+            "Content-Disposition": "attachment; filename*=UTF-8''%C3%A4bc.pdf",
+        }
+        monkeypatch.setattr(
+            server,
+            "_fetch_page_signals",
+            lambda url, *, ctx: (_ for _ in ()).throw(RuntimeError("no landing page")),
+        )
+        title = server._build_direct_pdf_fallback_title(
+            "https://gov.example/files/hash123.pdf",
+            signals,
+            headers,
+            ctx=ctx,
+        )
+        assert title == "äbc.pdf"
+
+    def test_cascade_content_disposition_skipped_if_same_as_url_filename(
+        self, monkeypatch, ctx
+    ):
+        """If Content-Disposition filename matches URL filename, skip it (no new info)."""
+        signals = {"title": None}
+        headers = {"Content-Disposition": 'attachment; filename="abc.pdf"'}
+        monkeypatch.setattr(
+            server,
+            "_fetch_page_signals",
+            lambda url, *, ctx: (_ for _ in ()).throw(RuntimeError("no landing page")),
+        )
+        title = server._build_direct_pdf_fallback_title(
+            "https://gov.example/files/abc.pdf",
+            signals,
+            headers,
+            ctx=ctx,
+        )
+        assert title == "abc.pdf"  # from URL filename fallback, not from CD
+
+    def test_cascade_url_filename_final_fallback(self, monkeypatch, ctx):
+        signals = {"title": None}
+        monkeypatch.setattr(
+            server,
+            "_fetch_page_signals",
+            lambda url, *, ctx: (_ for _ in ()).throw(RuntimeError("no landing page")),
+        )
+        title = server._build_direct_pdf_fallback_title(
+            "https://gov.example/files/abc.pdf",
+            signals,
+            None,
+            ctx=ctx,
+        )
+        assert title == "abc.pdf"
+
+    def test_cascade_handles_none_signals(self, monkeypatch, ctx):
+        monkeypatch.setattr(
+            server,
+            "_fetch_page_signals",
+            lambda url, *, ctx: (_ for _ in ()).throw(RuntimeError("no landing page")),
+        )
+        title = server._build_direct_pdf_fallback_title(
+            "https://gov.example/files/abc.pdf",
+            None,
+            None,
+            ctx=ctx,
+        )
+        assert title == "abc.pdf"

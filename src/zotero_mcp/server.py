@@ -21,7 +21,7 @@ import sys
 import tempfile
 import textwrap
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
 import uuid
 import xml.etree.ElementTree as ET
@@ -1951,6 +1951,58 @@ def _parse_content_disposition_filename(header_value: str) -> str | None:
         return plain_match.group(1).strip()
 
     return None
+
+
+def _build_direct_pdf_fallback_title(
+    url: str,
+    pdf_signals: dict[str, Any] | None,
+    pdf_headers: Mapping[str, str] | None,
+    *,
+    ctx: Context,
+) -> str:
+    """Build a fallback title for a direct PDF URL when no DOI/arXiv was found.
+
+    Cascade (first non-empty wins):
+      1. PDF XMP metadata title (already extracted by `_extract_pdf_probe_signals`)
+      2. HTML landing page `og:title` (via `_guess_landing_page_url`
+         + `_fetch_page_signals`, best-effort)
+      3. HTTP `Content-Disposition` filename (RFC 5987 aware, only if it differs
+         from the URL filename — otherwise no new information)
+      4. URL filename (previous behavior, last resort)
+    """
+    # 1. XMP title from PyMuPDF
+    if pdf_signals:
+        xmp_title = pdf_signals.get("title")
+        if xmp_title:
+            return xmp_title
+
+    # 2. HTML landing page og:title, best-effort
+    landing_url = _guess_landing_page_url(url)
+    if landing_url:
+        try:
+            landing_signals = _fetch_page_signals(landing_url, ctx=ctx)
+            landing_title = landing_signals.get("title")
+            if landing_title:
+                return landing_title
+        except Exception as exc:
+            _ctx_warning(
+                ctx,
+                f"landing page title probe failed for {landing_url}: {exc}",
+            )
+
+    # 3. Content-Disposition filename — only if it differs from URL filename
+    #    (otherwise it carries no new information).
+    url_filename = Path(urlparse(url).path).name
+    if pdf_headers:
+        cd_value = ""
+        if hasattr(pdf_headers, "get"):
+            cd_value = pdf_headers.get("Content-Disposition", "") or ""
+        cd_filename = _parse_content_disposition_filename(cd_value)
+        if cd_filename and cd_filename.lower() != url_filename.lower():
+            return cd_filename
+
+    # 4. URL filename
+    return url_filename or url
 
 
 def _fetch_page_signals(url: str, *, ctx: Context) -> dict[str, Any]:
