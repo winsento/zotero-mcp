@@ -1897,6 +1897,52 @@ def _fallback_signals_from_known_landing_page(url: str) -> dict[str, Any] | None
     }
 
 
+def _decode_html_body(body: bytes, content_type: str) -> str:
+    """Decode an HTML response body by trying multiple charset sources.
+
+    Cascade (first successful decode wins):
+      1. `charset=` directive in the HTTP `Content-Type` header
+      2. `<meta charset>` / `<meta http-equiv="Content-Type">` declaration in
+         the first 4 KB of the body
+      3. `charset_normalizer` best-effort detection (transitive dep via
+         `requests`)
+      4. UTF-8 with `errors="replace"` as the final fallback
+
+    Fixes mojibake for pages declaring a non-UTF-8 charset, common on legacy
+    CMSes serving windows-1251 without a charset parameter in the HTTP header.
+    """
+    # 1. HTTP Content-Type charset=
+    cs_match = re.search(r"charset=([^\s;]+)", content_type or "", re.I)
+    if cs_match:
+        with suppress(LookupError, UnicodeDecodeError):
+            return body.decode(cs_match.group(1).strip().lower(), errors="replace")
+
+    # 2. <meta charset> / <meta http-equiv=...> sniff from first 4KB
+    sniff = body[:4096]
+    meta_match = re.search(
+        rb'<meta[^>]+charset\s*=\s*["\']?([A-Za-z0-9_-]+)',
+        sniff,
+        re.I,
+    )
+    if meta_match:
+        with suppress(LookupError, UnicodeDecodeError):
+            cs = meta_match.group(1).decode("ascii", errors="ignore").strip().lower()
+            return body.decode(cs, errors="replace")
+
+    # 3. charset-normalizer best-effort (transitive dep via requests)
+    try:
+        from charset_normalizer import from_bytes
+
+        best = from_bytes(body).best()
+        if best is not None:
+            return str(best)
+    except ImportError:
+        pass
+
+    # 4. Final fallback: UTF-8 with replace
+    return body.decode("utf-8", errors="replace")
+
+
 def _fetch_page_signals(url: str, *, ctx: Context) -> dict[str, Any]:
     import urllib.request
 
