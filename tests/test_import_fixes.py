@@ -44,3 +44,36 @@ class TestFallbackTitleCascade:
     def test_guess_landing_page_returns_none_for_non_pdf(self):
         assert server._guess_landing_page_url("https://gov.example/index.html") is None
         assert server._guess_landing_page_url("https://gov.example/api/v1/items") is None
+
+    def test_parse_content_disposition_rfc5987_utf8(self):
+        # RFC 5987 encoded filename, UTF-8, non-ASCII characters (Latin-1 accents
+        # used here are arbitrary — only the decode pathway is under test).
+        header = "attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf"
+        assert server._parse_content_disposition_filename(header) == "résumé.pdf"
+
+    def test_parse_content_disposition_plain_quoted(self):
+        assert (
+            server._parse_content_disposition_filename(
+                'attachment; filename="report.pdf"'
+            )
+            == "report.pdf"
+        )
+
+    def test_parse_content_disposition_plain_unquoted(self):
+        assert (
+            server._parse_content_disposition_filename("inline; filename=report.pdf")
+            == "report.pdf"
+        )
+
+    def test_parse_content_disposition_prefers_rfc5987_over_plain(self):
+        # When both filename= and filename*= are present, RFC 5987 form wins.
+        header = (
+            'attachment; filename="fallback.pdf"; '
+            "filename*=UTF-8''%C3%A4bc.pdf"
+        )
+        assert server._parse_content_disposition_filename(header) == "äbc.pdf"
+
+    def test_parse_content_disposition_empty_or_missing(self):
+        assert server._parse_content_disposition_filename("") is None
+        assert server._parse_content_disposition_filename("inline") is None
+        assert server._parse_content_disposition_filename("attachment") is None

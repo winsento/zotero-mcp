@@ -1924,6 +1924,35 @@ def _guess_landing_page_url(pdf_url: str) -> str | None:
     )
 
 
+def _parse_content_disposition_filename(header_value: str) -> str | None:
+    """Parse Content-Disposition header, preferring RFC 5987 `filename*=` over
+    the plain `filename=` directive.
+
+    Handles the encoded form `filename*=charset'lang'percent-encoded-value`
+    (RFC 5987/8187) and the plain form `filename="name"` or `filename=name`.
+    Returns None if the header is empty or contains no filename directive.
+    """
+    if not header_value:
+        return None
+
+    # RFC 5987: filename*=charset'lang'encoded-value — wins over plain filename=.
+    ext_match = re.search(r"filename\*\s*=\s*([^;]+)", header_value, re.I)
+    if ext_match:
+        raw = ext_match.group(1).strip()
+        parts = raw.split("'", 2)
+        if len(parts) == 3:
+            charset, _lang, value = parts
+            with suppress(Exception):
+                return unquote(value, encoding=charset or "utf-8")
+
+    # Plain filename= (possibly quoted).
+    plain_match = re.search(r'filename\s*=\s*"?([^";]+)"?', header_value, re.I)
+    if plain_match:
+        return plain_match.group(1).strip()
+
+    return None
+
+
 def _fetch_page_signals(url: str, *, ctx: Context) -> dict[str, Any]:
     import urllib.request
 
