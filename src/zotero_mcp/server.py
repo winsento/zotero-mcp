@@ -21,8 +21,8 @@ import sys
 import tempfile
 import textwrap
 import time
-from typing import Any, Literal
-from urllib.parse import unquote, urljoin, urlparse
+from typing import Any, Literal, Mapping
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -1104,7 +1104,7 @@ def _probe_identifier_from_direct_pdf_url(
                             web_zot.delete_item(web_payload)
 
     try:
-        pdf_bytes, _ = _download_pdf_bytes(pdf_url, ctx=ctx)
+        pdf_bytes, _, pdf_headers = _download_pdf_bytes(pdf_url, ctx=ctx)
     except Exception as exc:
         _ctx_warning(ctx, f"Direct PDF probe download failed for {pdf_url}: {exc}")
         connector_signals = _probe_via_local_connector()
@@ -1117,6 +1117,9 @@ def _probe_identifier_from_direct_pdf_url(
         return None
 
     signals = _extract_pdf_probe_signals(pdf_bytes, pdf_url=pdf_url, ctx=ctx)
+    # Pass response headers through so the direct-PDF fallback title cascade
+    # can parse Content-Disposition (see _build_direct_pdf_fallback_title).
+    signals["response_headers"] = pdf_headers
     # Always return the extracted signals (possibly empty). The caller uses
     # signals.get("title") for the fallback title cascade. Calling the
     # connector probe as a second-pass after a successful direct download is
@@ -1894,6 +1897,111 @@ def _fallback_signals_from_known_landing_page(url: str) -> dict[str, Any] | None
         "pdf_candidates": [{"source": "url_pattern:cvf_pdf", "url": inferred_pdf_url}],
         "content_type": "",
     }
+
+
+def _guess_landing_page_url(pdf_url: str) -> str | None:
+    """Heuristic: for URLs like https://host/path/doc.pdf, return
+    https://host/path/ as a potential HTML landing page. Returns None if the
+    input is not a .pdf URL or if the .pdf lives directly at the host root.
+
+    Used by the direct-PDF fallback title cascade as a second-tier title
+    source when PDF XMP metadata doesn't provide a good title.
+    """
+    parsed = urlparse(pdf_url)
+    if not parsed.path.lower().endswith(".pdf"):
+        return None
+    parent = str(Path(parsed.path).parent)
+    if parent in ("/", "", "."):
+        return None
+    return urlunparse(
+        parsed._replace(
+            path=parent.rstrip("/") + "/",
+            params="",
+            query="",
+            fragment="",
+        )
+    )
+
+
+def _parse_content_disposition_filename(header_value: str) -> str | None:
+    """Parse Content-Disposition header, preferring RFC 5987 `filename*=` over
+    the plain `filename=` directive.
+
+    Handles the encoded form `filename*=charset'lang'percent-encoded-value`
+    (RFC 5987/8187) and the plain form `filename="name"` or `filename=name`.
+    Returns None if the header is empty or contains no filename directive.
+    """
+    if not header_value:
+        return None
+
+    # RFC 5987: filename*=charset'lang'encoded-value — wins over plain filename=.
+    ext_match = re.search(r"filename\*\s*=\s*([^;]+)", header_value, re.I)
+    if ext_match:
+        raw = ext_match.group(1).strip()
+        parts = raw.split("'", 2)
+        if len(parts) == 3:
+            charset, _lang, value = parts
+            with suppress(Exception):
+                return unquote(value, encoding=charset or "utf-8")
+
+    # Plain filename= (possibly quoted).
+    plain_match = re.search(r'filename\s*=\s*"?([^";]+)"?', header_value, re.I)
+    if plain_match:
+        return plain_match.group(1).strip()
+
+    return None
+
+
+def _build_direct_pdf_fallback_title(
+    url: str,
+    pdf_signals: dict[str, Any] | None,
+    pdf_headers: Mapping[str, str] | None,
+    *,
+    ctx: Context,
+) -> str:
+    """Build a fallback title for a direct PDF URL when no DOI/arXiv was found.
+
+    Cascade (first non-empty wins):
+      1. PDF XMP metadata title (already extracted by `_extract_pdf_probe_signals`)
+      2. HTML landing page `og:title` (via `_guess_landing_page_url`
+         + `_fetch_page_signals`, best-effort)
+      3. HTTP `Content-Disposition` filename (RFC 5987 aware, only if it differs
+         from the URL filename — otherwise no new information)
+      4. URL filename (previous behavior, last resort)
+    """
+    # 1. XMP title from PyMuPDF
+    if pdf_signals:
+        xmp_title = pdf_signals.get("title")
+        if xmp_title:
+            return xmp_title
+
+    # 2. HTML landing page og:title, best-effort
+    landing_url = _guess_landing_page_url(url)
+    if landing_url:
+        try:
+            landing_signals = _fetch_page_signals(landing_url, ctx=ctx)
+            landing_title = landing_signals.get("title")
+            if landing_title:
+                return landing_title
+        except Exception as exc:
+            _ctx_warning(
+                ctx,
+                f"landing page title probe failed for {landing_url}: {exc}",
+            )
+
+    # 3. Content-Disposition filename — only if it differs from URL filename
+    #    (otherwise it carries no new information).
+    url_filename = Path(urlparse(url).path).name
+    if pdf_headers:
+        cd_value = ""
+        if hasattr(pdf_headers, "get"):
+            cd_value = pdf_headers.get("Content-Disposition", "") or ""
+        cd_filename = _parse_content_disposition_filename(cd_value)
+        if cd_filename and cd_filename.lower() != url_filename.lower():
+            return cd_filename
+
+    # 4. URL filename
+    return url_filename or url
 
 
 def _fetch_page_signals(url: str, *, ctx: Context) -> dict[str, Any]:
@@ -4589,7 +4697,7 @@ def _download_pdf_bytes_via_playwright(
     pdf_url: str,
     *,
     ctx: Context | None = None,
-) -> tuple[bytes, str] | None:
+) -> tuple[bytes, str, dict[str, str]] | None:
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
     except Exception:
@@ -4666,7 +4774,7 @@ def _download_pdf_bytes_via_playwright(
                         if body and (
                             "application/pdf" in content_type.lower() or body.startswith(b"%PDF")
                         ):
-                            return body, content_type or "application/pdf"
+                            return body, content_type or "application/pdf", dict(headers)
 
                 candidate_urls: list[str] = []
                 for candidate in [str(page.url or ""), pdf_url, *response_urls]:
@@ -4701,7 +4809,7 @@ def _download_pdf_bytes_via_playwright(
                         if body and (
                             "application/pdf" in content_type.lower() or body.startswith(b"%PDF")
                         ):
-                            return body, content_type or "application/pdf"
+                            return body, content_type or "application/pdf", dict(headers)
             finally:
                 context.close()
                 if browser is not None:
@@ -4714,7 +4822,9 @@ def _download_pdf_bytes_via_playwright(
     return None
 
 
-def _download_pdf_bytes(pdf_url: str, *, ctx: Context | None = None) -> tuple[bytes, str]:
+def _download_pdf_bytes(
+    pdf_url: str, *, ctx: Context | None = None
+) -> tuple[bytes, str, dict[str, str]]:
     headers = {"User-Agent": "Mozilla/5.0 zotero-mcp/1.0"}
     errors: list[str] = []
     request_plans = [
@@ -4748,7 +4858,7 @@ def _download_pdf_bytes(pdf_url: str, *, ctx: Context | None = None) -> tuple[by
 
             if "application/pdf" not in content_type.lower() and not first_chunk.startswith(b"%PDF"):
                 raise ValueError("response is not a PDF")
-            return pdf_bytes, content_type
+            return pdf_bytes, content_type, dict(response.headers)
         except Exception as exc:
             errors.append(f"{plan['label']} attempt {index}: {exc}")
             if index < len(request_plans):
@@ -4822,7 +4932,7 @@ def _attach_pdf_from_url(
                 )
 
         ctx.info(f"Downloading PDF from {pdf_url}")
-        pdf_bytes, _ = _download_pdf_bytes(pdf_url, ctx=ctx)
+        pdf_bytes, _, _ = _download_pdf_bytes(pdf_url, ctx=ctx)
         with tempfile.TemporaryDirectory(prefix="zotero-mcp-") as tmpdir:
             tmp_path = Path(tmpdir) / filename
             tmp_path.write_bytes(pdf_bytes)
@@ -9236,11 +9346,19 @@ def add_items_by_identifier(
                             ctx=ctx,
                         )
                         continue
+                    _pdf_headers = (
+                        pdf_signals.get("response_headers") if pdf_signals else None
+                    )
                     created = _create_webpage_item(
                         zot,
                         raw_identifier,
                         collection_key=collection_key,
-                        title=Path(urlparse(raw_identifier).path).name or raw_identifier,
+                        title=_build_direct_pdf_fallback_title(
+                            raw_identifier,
+                            pdf_signals,
+                            _pdf_headers,
+                            ctx=ctx,
+                        ),
                         description="Imported from direct PDF URL; bibliographic metadata still needs review.",
                         abstract_note="Imported from direct PDF URL; bibliographic metadata still needs review.",
                         creators=[],
