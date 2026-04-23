@@ -8981,6 +8981,53 @@ def add_linked_url_attachment(
         return f"Error: {e}"
 
 
+def _attach_local_file_to_item_direct(
+    zot,
+    item_key: str,
+    path: Path,
+    *,
+    title: str | None = None,
+    label: str = "File",
+) -> str:
+    """Attach a local file (already on disk) to an existing Zotero item as
+    ``imported_file`` via pyzotero — no cascade, no recovery, no parent swap.
+
+    Used by both ``attach_file_to_item`` and ``attach_pdf_from_url`` to keep
+    the attachment path and the response-formatting logic in one place.
+
+    Args:
+        zot: pyzotero Zotero client (already authenticated).
+        item_key: Key of the parent Zotero item.
+        path: Absolute path to the local file to upload.
+        title: Optional display title — when provided, ``attachment_both``
+            is used, otherwise ``attachment_simple``.
+        label: User-facing prefix in the success message (``"File"`` or
+            ``"PDF"``).
+
+    Returns:
+        Success or failure string matching the style of other write tools.
+    """
+    if title:
+        resp = zot.attachment_both([(title, str(path))], item_key)
+    else:
+        resp = zot.attachment_simple([str(path)], item_key)
+
+    successful = resp.get("successful") or resp.get("success") or {}
+    if successful:
+        first = (
+            next(iter(successful.values()))
+            if isinstance(successful, dict)
+            else successful[0]
+        )
+        if isinstance(first, dict):
+            key = (first.get("data") or first).get("key", "?")
+        else:
+            key = "?"
+        return f"✓ {label} attached to {item_key} → attachment key `{key}`"
+    failed = resp.get("failed") or resp.get("failure") or {}
+    return f"✗ Failed: {failed}"
+
+
 @mcp.tool(
     name="zotero_attach_file_to_item",
     description=(
@@ -9000,12 +9047,12 @@ def attach_file_to_item(
 ) -> str:
     """Attach a local file from disk to an existing Zotero item as imported_file.
 
-    All file types (including PDFs) use the same direct pyzotero path:
-    ``zot.attachment_simple`` for default filename, ``zot.attachment_both``
-    when a custom display title is supplied. The import-flow cascade that
-    powers ``add_items_by_*`` is **not** used here — it can create a separate
-    local item and trash the original via its recovery path, which would
-    destroy the user item this tool is attaching to.
+    All file types (including PDFs) go through
+    :func:`_attach_local_file_to_item_direct` — a thin pyzotero wrapper with
+    no cascade. The import-flow cascade that powers ``add_items_by_*`` is
+    **not** used here — it can create a separate local item and trash the
+    original via its recovery path, which would destroy the user item this
+    tool is attaching to.
 
     Args:
         item_key: Key of the parent Zotero item.
@@ -9026,26 +9073,9 @@ def attach_file_to_item(
                 "Error: Web API credentials not configured. "
                 "Set ZOTERO_API_KEY and ZOTERO_LIBRARY_ID."
             )
-
-        if title:
-            resp = zot.attachment_both([(title, str(path))], item_key)
-        else:
-            resp = zot.attachment_simple([str(path)], item_key)
-
-        successful = resp.get("successful") or resp.get("success") or {}
-        if successful:
-            first = (
-                next(iter(successful.values()))
-                if isinstance(successful, dict)
-                else successful[0]
-            )
-            if isinstance(first, dict):
-                key = (first.get("data") or first).get("key", "?")
-            else:
-                key = "?"
-            return f"✓ File attached to {item_key} → attachment key `{key}`"
-        failed = resp.get("failed") or resp.get("failure") or {}
-        return f"✗ Failed: {failed}"
+        return _attach_local_file_to_item_direct(
+            zot, item_key, path, title=title, label="File"
+        )
     except Exception as exc:
         ctx.error(f"Error in attach_file_to_item: {exc}")
         return f"Error: {exc}"
@@ -9054,11 +9084,11 @@ def attach_file_to_item(
 @mcp.tool(
     name="zotero_attach_pdf_from_url",
     description=(
-        "Download a PDF from a URL and attach it to an existing Zotero item "
-        "as an imported_file attachment. Reuses the identifier-import download "
-        "cascade: direct HTTP, Playwright fallback for protected hosts, Zotero "
-        "local connector fast-path for bulk uploads. Requires ZOTERO_API_KEY + "
-        "ZOTERO_LIBRARY_ID."
+        "Download a PDF from a URL (direct HTTP, with Playwright fallback for "
+        "protected hosts) and attach it to an existing Zotero item as an "
+        "imported_file attachment via pyzotero attachment_simple — no import "
+        "cascade, no recovery path, so the parent item is never replaced or "
+        "trashed. Requires ZOTERO_API_KEY + ZOTERO_LIBRARY_ID."
     ),
 )
 def attach_pdf_from_url(
@@ -9068,6 +9098,15 @@ def attach_pdf_from_url(
     ctx: Context,
 ) -> str:
     """Download a PDF by URL and attach to an existing item as imported_file.
+
+    Uses the download helper ``_download_pdf_bytes`` (HTTP + Playwright
+    fallback — safe, does not manipulate Zotero items) and then writes the
+    bytes to a temporary file and calls ``zot.attachment_simple`` directly.
+    The import-flow cascade (``_attach_pdf_from_url`` → ``_attach_pdf_bytes``
+    with its ``_promote_local_copy_over_original`` recovery path) is **not**
+    used here for the same reason as in ``attach_file_to_item``: that
+    recovery path trashes the caller's existing user item when Web API sync
+    lags behind the local connector.
 
     Args:
         item_key: Key of the parent Zotero item.
@@ -9084,18 +9123,26 @@ def attach_pdf_from_url(
                 "Error: Web API credentials not configured. "
                 "Set ZOTERO_API_KEY and ZOTERO_LIBRARY_ID."
             )
-        result = _attach_pdf_from_url(
-            zot,
-            item_key,
-            url,
-            ctx=ctx,
-            source=f"user_url:{url}",
-        )
-        if result.get("success"):
-            src = result.get("pdf_source", "url")
-            msg = result.get("message", "")
-            return f"✓ PDF attached to {item_key} ({src}): {msg}"
-        return f"✗ Attach failed: {result.get('message', 'unknown error')}"
+
+        ctx.info(f"Downloading PDF from {url}")
+        try:
+            pdf_bytes, _content_type, _headers = _download_pdf_bytes(url, ctx=ctx)
+        except Exception as exc:
+            return f"✗ Download failed: {exc}"
+
+        # Determine a reasonable filename. Fall back to "download.pdf" if the
+        # URL path has no usable basename.
+        parsed_name = Path(urlparse(url).path).name
+        filename = parsed_name if parsed_name else "download.pdf"
+        if not filename.lower().endswith(".pdf"):
+            filename = f"{filename}.pdf"
+
+        with tempfile.TemporaryDirectory(prefix="zotero-mcp-url-attach-") as tmpdir:
+            tmp_path = Path(tmpdir) / filename
+            tmp_path.write_bytes(pdf_bytes)
+            return _attach_local_file_to_item_direct(
+                zot, item_key, tmp_path, label="PDF"
+            )
     except Exception as exc:
         ctx.error(f"Error in attach_pdf_from_url: {exc}")
         return f"Error: {exc}"

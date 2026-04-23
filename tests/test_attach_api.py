@@ -208,21 +208,46 @@ class TestAttachFileToItem:
 
 
 class TestAttachPdfFromUrl:
-    def test_delegates_to_private_helper(self, monkeypatch, ctx):
-        captured = {}
+    """attach_pdf_from_url must NOT route through `_attach_pdf_from_url`
+    helper — that helper calls `_attach_pdf_bytes`, whose recovery path
+    (`_promote_local_copy_over_original`) trashes the existing parent item
+    that the caller asked us to attach to (same bug as fix.05 for
+    attach_file_to_item, observed again on the URL path when M3MCXWKA was
+    replaced by FEXMLSHV with the original in trash).
 
-        def fake_attach(zot, item_key, url, *, ctx, source):
-            captured["item_key"] = item_key
-            captured["url"] = url
-            captured["source"] = source
-            return {
-                "success": True,
-                "pdf_source": f"user_url:{url}",
-                "message": f"PDF attached from user_url:{url}",
-            }
+    Correct flow: download bytes via `_download_pdf_bytes` (safe HTTP +
+    Playwright helper — no item manipulation), then call pyzotero
+    `attachment_simple` directly. No cascade, no recovery.
+    """
 
-        monkeypatch.setattr(server, "get_web_zotero_client", lambda: object())
-        monkeypatch.setattr(server, "_attach_pdf_from_url", fake_attach)
+    _FAKE_PDF = b"%PDF-1.4\nfake downloaded bytes"
+
+    def test_url_download_and_attach_uses_attachment_simple_not_cascade(
+        self, monkeypatch, ctx
+    ):
+        """attach_pdf_from_url must call attachment_simple and never the
+        _attach_pdf_from_url / _attach_pdf_bytes cascade."""
+        calls = {"download": 0, "simple": [], "cascade": 0}
+
+        def fake_download(url, *, ctx=None):
+            calls["download"] += 1
+            return (self._FAKE_PDF, "application/pdf", {})
+
+        class _FakeZot:
+            def attachment_simple(self_inner, files, parent_key):
+                calls["simple"].append((tuple(files), parent_key))
+                return {"successful": {"0": {"key": "URLATT1"}}}
+
+            def attachment_both(self_inner, *args, **kwargs):
+                return {"successful": {"0": {"key": "SHOULDNOTHAPPEN"}}}
+
+        def fake_cascade(*args, **kwargs):
+            calls["cascade"] += 1
+            return {"success": True, "pdf_source": "SHOULDNOTHAPPEN", "message": ""}
+
+        monkeypatch.setattr(server, "get_web_zotero_client", lambda: _FakeZot())
+        monkeypatch.setattr(server, "_download_pdf_bytes", fake_download)
+        monkeypatch.setattr(server, "_attach_pdf_from_url", fake_cascade)
 
         result = server.attach_pdf_from_url(
             item_key="ABC123",
@@ -230,32 +255,88 @@ class TestAttachPdfFromUrl:
             ctx=ctx,
         )
 
-        assert captured["item_key"] == "ABC123"
-        assert captured["url"] == "http://example.org/paper.pdf"
-        assert captured["source"] == "user_url:http://example.org/paper.pdf"
-        assert "✓" in result and "ABC123" in result
+        assert calls["download"] == 1
+        assert len(calls["simple"]) == 1
+        _files, parent_key = calls["simple"][0]
+        assert parent_key == "ABC123"
+        assert calls["cascade"] == 0, (
+            "URL attach must bypass _attach_pdf_from_url / _attach_pdf_bytes cascade"
+        )
+        assert "URLATT1" in result and "ABC123" in result
 
-    def test_propagates_failure_message(self, monkeypatch, ctx):
-        def fake_attach(zot, item_key, url, *, ctx, source):
-            return {
-                "success": False,
-                "pdf_source": f"user_url:{url}",
-                "message": "download failed: 403 Forbidden",
+    def test_url_attach_does_not_trash_existing_item(
+        self, monkeypatch, patch_web_client, ctx
+    ):
+        """End-to-end-style: existing user item stays in the library after
+        attach_pdf_from_url, never appears in deleted_items."""
+        patch_web_client._items["USRURL"] = {
+            "data": {
+                "key": "USRURL",
+                "itemType": "book",
+                "title": "Existing user book with URL attach",
+                "collections": [],
             }
+        }
 
-        monkeypatch.setattr(server, "get_web_zotero_client", lambda: object())
-        monkeypatch.setattr(server, "_attach_pdf_from_url", fake_attach)
+        def fake_download(url, *, ctx=None):
+            return (self._FAKE_PDF, "application/pdf", {})
+
+        original_simple = patch_web_client.attachment_simple
+
+        def simple_with_response(files, parent_key):
+            original_simple(files, parent_key)
+            return {"successful": {"0": {"key": "ATTURL1"}}}
+
+        monkeypatch.setattr(server, "_download_pdf_bytes", fake_download)
+        monkeypatch.setattr(patch_web_client, "attachment_simple", simple_with_response)
 
         result = server.attach_pdf_from_url(
-            item_key="ABC123",
+            item_key="USRURL",
+            url="http://example.org/paper.pdf",
+            ctx=ctx,
+        )
+
+        assert "USRURL" in patch_web_client._items
+        assert all(
+            (d.get("key") if isinstance(d, dict) else None) != "USRURL"
+            for d in patch_web_client.deleted_items
+        ), "Original item was trashed by URL-attach cascade recovery — regression"
+        assert any(parent == "USRURL" for _, parent in patch_web_client.attached_files)
+        assert "✓" in result and "USRURL" in result
+
+    def test_url_download_failure_propagates_without_item_change(
+        self, monkeypatch, patch_web_client, ctx
+    ):
+        """If the download itself fails, the tool returns an error without
+        touching the parent item (no cascade, no trash, no duplicate)."""
+        patch_web_client._items["USRURL2"] = {
+            "data": {"key": "USRURL2", "itemType": "book", "title": "Untouched"}
+        }
+
+        def failing_download(url, *, ctx=None):
+            raise RuntimeError("HTTP 403 Forbidden")
+
+        monkeypatch.setattr(server, "_download_pdf_bytes", failing_download)
+
+        result = server.attach_pdf_from_url(
+            item_key="USRURL2",
             url="http://protected.example/paper.pdf",
             ctx=ctx,
         )
 
-        assert "✗" in result
+        # Parent must stay untouched.
+        assert "USRURL2" in patch_web_client._items
+        assert all(
+            (d.get("key") if isinstance(d, dict) else None) != "USRURL2"
+            for d in patch_web_client.deleted_items
+        )
+        # No attach attempts were made.
+        assert not any(parent == "USRURL2" for _, parent in patch_web_client.attached_files)
+        # Error string propagates 403.
+        assert "✗" in result or "Error" in result
         assert "403" in result
 
-    def test_no_web_client_returns_error(self, monkeypatch, ctx):
+    def test_url_attach_no_web_client_returns_error(self, monkeypatch, ctx):
         monkeypatch.setattr(server, "get_web_zotero_client", lambda: None)
         result = server.attach_pdf_from_url(
             item_key="ABC123",
