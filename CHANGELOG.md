@@ -11,11 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`zotero_attach_file_to_item`** — new public MCP tool that uploads a local
   file (PDF, DOCX, EPUB, etc.) from disk to Zotero as an `imported_file`
-  attachment on an existing item. For PDFs, routes through the existing
-  `_attach_pdf_bytes` cascade (Web API → Zotero local connector → recovery).
-  Other file types use pyzotero's `attachment_simple` / `attachment_both`
-  (the latter when a custom title is supplied). Fills a gap where no public
-  tool existed to attach a file that was already on disk.
+  attachment on an existing item. Uses pyzotero's `attachment_simple` /
+  `attachment_both` (the latter when a custom title is supplied) for **all**
+  file types — no cascade, no recovery path, so the parent item is never
+  replaced or trashed. The import-flow cascade (`_attach_pdf_bytes` with its
+  `_promote_local_copy_over_original` recovery) is deliberately **not** used
+  here: it was designed for create-new-item flows and can destroy the user
+  item the tool is attaching to. Fills a gap where no public tool existed to
+  attach a file that was already on disk.
 - **`zotero_attach_pdf_from_url`** — new public MCP tool that downloads a PDF
   from an arbitrary URL and attaches it to an existing Zotero item as an
   `imported_file` attachment. Thin wrapper over the internal
