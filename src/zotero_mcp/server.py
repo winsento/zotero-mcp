@@ -8821,9 +8821,9 @@ def add_linked_url_attachment(
     name="zotero_attach_file_to_item",
     description=(
         "Upload a local file (PDF, DOCX, EPUB, etc.) from disk to Zotero as an "
-        "imported_file attachment to an existing item. For PDFs, uses the full "
-        "attach cascade with Zotero local connector fallback; for other types, "
-        "uses pyzotero's attachment_simple / attachment_both directly. Requires "
+        "imported_file attachment to an existing item. Uses pyzotero's "
+        "attachment_simple / attachment_both directly — no cascade, no recovery "
+        "path — so the parent item is never replaced or trashed. Requires "
         "ZOTERO_API_KEY + ZOTERO_LIBRARY_ID for Web API uploads."
     ),
 )
@@ -8835,6 +8835,13 @@ def attach_file_to_item(
     ctx: Context,
 ) -> str:
     """Attach a local file from disk to an existing Zotero item as imported_file.
+
+    All file types (including PDFs) use the same direct pyzotero path:
+    ``zot.attachment_simple`` for default filename, ``zot.attachment_both``
+    when a custom display title is supplied. The import-flow cascade that
+    powers ``add_items_by_*`` is **not** used here — it can create a separate
+    local item and trash the original via its recovery path, which would
+    destroy the user item this tool is attaching to.
 
     Args:
         item_key: Key of the parent Zotero item.
@@ -8856,27 +8863,11 @@ def attach_file_to_item(
                 "Set ZOTERO_API_KEY and ZOTERO_LIBRARY_ID."
             )
 
-        if path.suffix.lower() == ".pdf":
-            pdf_bytes = path.read_bytes()
-            result = _attach_pdf_bytes(
-                zot,
-                item_key,
-                pdf_bytes,
-                filename=title or path.name,
-                ctx=ctx,
-                source=f"user_local_file:{path.name}",
-            )
-            if result.get("success"):
-                src = result.get("pdf_source", "local_file")
-                msg = result.get("message", "")
-                return f"✓ File attached to {item_key} ({src}): {msg}"
-            return f"✗ Attach failed: {result.get('message', 'unknown error')}"
-
-        # Non-PDF: use pyzotero directly.
         if title:
             resp = zot.attachment_both([(title, str(path))], item_key)
         else:
             resp = zot.attachment_simple([str(path)], item_key)
+
         successful = resp.get("successful") or resp.get("success") or {}
         if successful:
             first = (
